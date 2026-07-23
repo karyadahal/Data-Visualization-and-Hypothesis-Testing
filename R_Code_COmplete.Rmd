@@ -1,0 +1,774 @@
+---
+title: "SIM_RCode_DSL1T1_G2"
+output: pdf_document
+date: "2026-07-23"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+```{r cars}
+summary(cars)
+```
+
+## Including Plots
+
+You can also embed plots, for example:
+
+```{r pressure, echo=FALSE}
+plot(pressure)
+```
+
+Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
+# Student Depression Analysis using Statistical Inference and Modelling in R
+# ITS66804 Group Assignment | Kaggle Student Depression Dataset
+# This script is designed to run from top to bottom in RStudio.
+
+####################################################
+# SECTION 1: LIBRARIES
+####################################################
+```{r}
+
+```
+
+# Install any required package that is not already available, then load it.
+required_packages <- c(
+  "tidyverse", "psych", "ggplot2", "car", "lmtest", "ResourceSelection",
+  "pROC", "caret", "broom", "DescTools", "corrplot", "nortest",
+  "effectsize", "PerformanceAnalytics", "reshape2"
+)
+
+install_and_load <- function(package_name) {
+  if (!requireNamespace(package_name, quietly = TRUE)) {
+    install.packages(package_name, dependencies = TRUE)
+  }
+  suppressPackageStartupMessages(library(package_name, character.only = TRUE))
+}
+
+invisible(lapply(required_packages, install_and_load))
+
+# Reproducibility and consistent reporting settings.
+set.seed(66804)
+options(scipen = 999, stringsAsFactors = FALSE)
+alpha <- 0.05
+
+# User-facing output directory. All tables and publication-quality figures go here.
+results_dir <- file.path(getwd(), "Student_Depression_Results")
+if (!dir.exists(results_dir)) dir.create(results_dir, recursive = TRUE)
+
+# Use this directory so the unmodified EDA code saves its original figures here.
+setwd(results_dir)
+
+# Professional graph style used by all newly generated figures.
+project_theme <- theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold", colour = "#163A5F", hjust = 0.5),
+    plot.subtitle = element_text(hjust = 0.5),
+    axis.title = element_text(face = "bold"),
+    panel.grid.minor = element_blank(),
+    legend.position = "bottom"
+  )
+
+# A common interpretation printer required after every inferential procedure.
+print_inference <- function(hypothesis, p_value, interpretation, practical_conclusion,
+                            test_name = "Statistical test") {
+  decision <- ifelse(is.na(p_value), "Decision unavailable",
+                     ifelse(p_value < alpha, "Reject H0", "Fail to reject H0"))
+  cat("\n----------------------------------------------------\n")
+  cat(test_name, "\n")
+  cat("Hypothesis: ", hypothesis, "\n", sep = "")
+  cat("P-value: ", ifelse(is.na(p_value), "NA", format.pval(p_value, digits = 4)), "\n", sep = "")
+  cat("Decision: ", decision, " at alpha = ", alpha, ".\n", sep = "")
+  cat("Interpretation: ", interpretation, "\n", sep = "")
+  cat("Practical conclusion: ", practical_conclusion, "\n", sep = "")
+  cat("----------------------------------------------------\n")
+  invisible(decision)
+}
+
+# Shapiro-Wilk is sensitive with large samples. This helper samples at most 5,000
+# observations, which is the test's R limit, and returns a usable p-value.
+safe_shapiro <- function(x, max_n = 5000) {
+  x <- x[is.finite(x)]
+  if (length(x) < 3 || length(unique(x)) < 3) return(NA_real_)
+  if (length(x) > max_n) x <- sample(x, max_n)
+  tryCatch(shapiro.test(x)$p.value, error = function(e) NA_real_)
+}
+####################################################
+# SECTION 2: IMPORT DATASET
+####################################################
+
+# The default path is the provided dataset. If it is not found, an RStudio file
+# chooser is used so the script remains portable without editing the code.
+default_data_path <- "C:/Users/karya/Downloads/sim dataset/Student Depression Dataset.csv"
+data_path <- if (file.exists(default_data_path)) default_data_path else file.choose()
+df <- read.csv(data_path, stringsAsFactors = FALSE, check.names = TRUE)
+
+cat("Dataset imported from:", normalizePath(data_path, winslash = "/"), "\n")
+cat("Original dimensions:", nrow(df), "rows x", ncol(df), "columns\n")
+cat("Original variable names:\n")
+print(names(df))
+####################################################
+# SECTION 3: DATA CLEANING
+####################################################
+
+# Confirm that the source has the columns needed by the retained EDA section.
+required_raw_columns <- c(
+  "Gender", "Age", "Profession", "Academic.Pressure", "Work.Pressure", "CGPA",
+  "Study.Satisfaction", "Job.Satisfaction", "Sleep.Duration", "Dietary.Habits",
+  "Degree", "Have.you.ever.had.suicidal.thoughts..", "Work.Study.Hours",
+  "Financial.Stress", "Family.History.of.Mental.Illness", "Depression"
+)
+missing_columns <- setdiff(required_raw_columns, names(df))
+if (length(missing_columns) > 0) {
+  stop("The dataset is missing required column(s): ", paste(missing_columns, collapse = ", "))
+}
+
+# Preserve the original labels while treating blank text values as missing.
+df <- df %>% mutate(across(where(is.character), ~na_if(trimws(.x), "")))
+
+# Report missingness before imputation or complete-case filtering.
+missing_summary_before <- tibble(
+  Variable = names(df),
+  Missing = colSums(is.na(df)),
+  Missing_Percent = round(100 * colSums(is.na(df)) / nrow(df), 2)
+)
+print(missing_summary_before %>% filter(Missing > 0))
+
+# Keep the same modal-imputation principle as the supplied EDA script.
+get_mode <- function(x) {
+  ux <- na.omit(unique(x))
+  if (length(ux) == 0) return(NA)
+  ux[which.max(tabulate(match(x, ux)))]
+}
+
+fs_mode <- get_mode(df$Financial.Stress)
+df$Financial.Stress[is.na(df$Financial.Stress)] <- fs_mode
+cat("Missing Financial Stress values imputed with mode =", fs_mode, "\n")
+
+# Remove exact duplicate rows, retaining the first occurrence.
+duplicate_count <- sum(duplicated(df))
+cat("Number of duplicate rows:", 
+    duplicate_count, "\n")
+df <- df %>% distinct()
+
+# This is a student-focused study, therefore retain student observations only.
+cat("Profession distribution before filtering:\n")
+print(table(df$Profession, useNA = "ifany"))
+df <- df %>% filter(Profession == "Student")
+df <- df %>% select(-Profession, -Work.Pressure, -Job.Satisfaction)
+
+# Remove records missing analysis variables other than Financial Stress, which was
+# already imputed. This makes all tests and the regression analysis reproducible.
+analysis_required <- c(
+  "Gender", "Age", "Academic.Pressure", "CGPA", "Study.Satisfaction",
+  "Sleep.Duration", "Dietary.Habits", "Degree",
+  "Have.you.ever.had.suicidal.thoughts..", "Work.Study.Hours",
+  "Financial.Stress", "Family.History.of.Mental.Illness", "Depression"
+)
+complete_before <- nrow(df)
+df <- df %>% filter(if_all(all_of(analysis_required), ~ !is.na(.x)))
+cat("Rows removed because of remaining missing analysis values:", complete_before - nrow(df), "\n")
+
+# Assign meaningful types and stable factor levels for statistical modelling.
+df$Gender <- as.factor(df$Gender)
+df$Sleep.Duration <- factor(df$Sleep.Duration,
+                            levels = c("Less than 5 hours", "5-6 hours",
+                                       "7-8 hours", "More than 8 hours", "Others"))
+df$Dietary.Habits <- as.factor(df$Dietary.Habits)
+df$Degree <- as.factor(df$Degree)
+df$Have.you.ever.had.suicidal.thoughts.. <- as.factor(df$Have.you.ever.had.suicidal.thoughts..)
+df$Family.History.of.Mental.Illness <- as.factor(df$Family.History.of.Mental.Illness)
+df$Depression <- factor(df$Depression, levels = c(0, 1), labels = c("No", "Yes"))
+
+# Remove unused categories created by the explicit sleep-duration ordering.
+df <- df %>% mutate(across(where(is.factor), droplevels))
+
+cat("Final cleaned dataset dimensions:", nrow(df), "rows x", ncol(df), "columns\n")
+cat("Depression distribution after cleaning:\n")
+print(table(df$Depression))
+####################################################
+# SECTION 4: OUTLIER DETECTION
+####################################################
+
+# IQR method: values below Q1 - 1.5*IQR or above Q3 + 1.5*IQR are outliers.
+detect_outliers <- function(x) {
+  Q1 <- quantile(x, 0.25, na.rm = TRUE)
+  Q3 <- quantile(x, 0.75, na.rm = TRUE)
+  IQR_val <- Q3 - Q1
+  lower <- Q1 - 1.5 * IQR_val
+  upper <- Q3 + 1.5 * IQR_val
+  sum(x < lower | x > upper, na.rm = TRUE)
+}
+
+numeric_vars <- c("Age", "Academic.Pressure", "CGPA",
+                  "Study.Satisfaction", "Work.Study.Hours", "Financial.Stress")
+outlier_counts_before <- sapply(df[numeric_vars], detect_outliers)
+outlier_summary <- tibble(Variable = names(outlier_counts_before),
+                          IQR_Outliers_Before = as.integer(outlier_counts_before))
+cat("IQR outlier counts before treatment:\n")
+print(outlier_summary)
+
+# Winsorise numeric values to the IQR fences. The supplied EDA then retains its
+# original Age treatment exactly as provided, as requested.
+cap_outliers <- function(x) {
+  Q1 <- quantile(x, 0.25, na.rm = TRUE)
+  Q3 <- quantile(x, 0.75, na.rm = TRUE)
+  IQR_val <- Q3 - Q1
+  lower <- Q1 - 1.5 * IQR_val
+  upper <- Q3 + 1.5 * IQR_val
+  x[x < lower] <- lower
+  x[x > upper] <- upper
+  return(x)
+}
+
+# CGPA values of zero are implausible on the scale used by this dataset.
+cat("Rows with implausible CGPA = 0 before treatment:", sum(df$CGPA == 0), "\n")
+df <- df %>% filter(CGPA > 0)
+####################################################
+# SECTION 5: EXPLORATORY DATA ANALYSIS
+####################################################
+
+# The following complete EDA section is retained exactly as supplied by the group.
+
+# SECTION 4 EXPLORATORY DATA ANALYSIS AND VISUALIZATION
+
+descriptive_stats <- df %>%
+  select(all_of(numeric_vars)) %>%
+  summarise(across(everything(),
+                   list(Mean = ~mean(.x, na.rm = TRUE),
+                        Median = ~median(.x, na.rm = TRUE),
+                        Mode = ~get_mode(.x),
+                        SD = ~sd(.x, na.rm = TRUE),
+                        Variance = ~var(.x, na.rm = TRUE),
+                        Range = ~diff(range(.x, na.rm = TRUE)),
+                        IQR = ~IQR(.x, na.rm = TRUE)),
+                   .names = "{.col}__{.fn}")) %>%
+  pivot_longer(everything(), names_to = c("Variable","Statistic"),
+               names_sep = "__", values_to = "Value") %>%
+  pivot_wider(names_from = Statistic, values_from = Value)
+
+print(descriptive_stats, n = Inf)
+write.csv(descriptive_stats, "descriptive_statistics.csv", row.names = FALSE)
+
+
+# DIAGRAM 1 CATEGORICAL UNIVARIATE BAR CHART
+
+ggplot(df, aes(x = Depression, fill = Depression)) +
+  geom_bar() +
+  geom_text(stat = "count", aes(label = after_stat(count)), vjust = -0.4) +
+  labs(title = "Figure 1: Distribution of Depression Status Among Students",
+       x = "Depression Status", y = "Number of Students") +
+  scale_fill_manual(values = c("No" = "#4CAF50", "Yes" = "#E57373")) +
+  theme_minimal() +
+  theme(legend.position = "none")
+ggsave("fig1_barchart_depression.png", width = 6, height = 4.5, dpi = 300)
+
+
+# DIAGRAM 2 CATEGORICAL BIVARIATE DODGED BAR CHART
+
+ggplot(df, aes(x = Sleep.Duration, fill = Depression)) +
+  geom_bar(position = "dodge") +
+  labs(title = "Figure 2: Sleep Duration Distribution by Depression Status",
+       x = "Sleep Duration", y = "Number of Students") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 20, hjust = 1))
+ggsave("fig2_barchart_sleep.png", width = 7, height = 4.5, dpi = 300)
+
+
+# DIAGRAM 3 CONTINUOUS NUMERIC HISTOGRAM AGE
+
+ggplot(df, aes(x = Age)) +
+  geom_histogram(binwidth = 2, fill = "#42A5F5", color = "white") +
+  labs(title = "Figure 3: Histogram of Student Age", x = "Age (years)", y = "Frequency") +
+  theme_minimal()
+ggsave("fig3_histogram_age.png", width = 6, height = 4.5, dpi = 300)
+
+
+# DIAGRAM 4 CONTINUOUS NUMERIC HISTOGRAM CGPA
+
+ggplot(df, aes(x = CGPA)) +
+  geom_histogram(binwidth = 0.5, fill = "#AB47BC", color = "white") +
+  labs(title = "Figure 4: Histogram of CGPA", x = "CGPA", y = "Frequency") +
+  theme_minimal()
+ggsave("fig4_histogram_cgpa.png", width = 6, height = 4.5, dpi = 300)
+
+
+# DIAGRAM 5 CUMULATIVE FREQUENCY LINE GRAPH OGIVE
+
+age_breaks <- seq(floor(min(df$Age)), ceiling(max(df$Age)), by = 2)
+age_freq <- cut(df$Age, breaks = age_breaks, right = FALSE)
+freq_table <- table(age_freq)
+cum_freq <- cumsum(freq_table)
+
+ogive_df <- data.frame(UpperBoundary = age_breaks[-1],
+                       CumulativeFrequency = as.numeric(cum_freq))
+
+ggplot(ogive_df, aes(x = UpperBoundary, y = CumulativeFrequency)) +
+  geom_line(color = "#EF6C00", linewidth = 1) +
+  geom_point(color = "#EF6C00", size = 2) +
+  labs(title = "Figure 5: Ogive (Cumulative Frequency Curve) of Student Age",
+       x = "Age (Upper Class Boundary)", y = "Cumulative Frequency") +
+  theme_minimal()
+ggsave("fig5_ogive_age.png", width = 6, height = 4.5, dpi = 300)
+
+
+# DIAGRAM 6 NUMERIC VS CATEGORICAL BOXPLOT
+
+ggplot(df, aes(x = Depression, y = Academic.Pressure, fill = Depression)) +
+  geom_boxplot() +
+  labs(title = "Figure 6: Academic Pressure by Depression Status",
+       x = "Depression Status", y = "Academic Pressure (0-5 scale)") +
+  scale_fill_manual(values = c("No" = "#4CAF50", "Yes" = "#E57373")) +
+  theme_minimal() +
+  theme(legend.position = "none")
+ggsave("fig6_boxplot_academic_pressure.png", width = 6, height = 4.5, dpi = 300)
+
+
+# DIAGRAM 7 MULTIVARIATE CORRELATION HEATMAP MATRIX
+
+num_df <- df %>% select(all_of(numeric_vars))
+corr_matrix <- round(cor(num_df, use = "complete.obs"), 2)
+print(corr_matrix)
+
+corr_long <- as.data.frame(as.table(corr_matrix))
+ggplot(corr_long, aes(Var1, Var2, fill = Freq)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = Freq), size = 3) +
+  scale_fill_gradient2(low = "#2166AC", mid = "white", high = "#B2182B",
+                       midpoint = 0, limit = c(-1,1), name = "Correlation") +
+  labs(title = "Figure 7: Correlation Heatmap of Numeric Variables", x = "", y = "") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+ggsave("fig7_correlation_heatmap.png", width = 6.5, height = 5.5, dpi = 300)
+
+# SECTION 5 EXPORT CLEANED DATASET
+
+write.csv(df, "Student_Depression_Cleaned.csv", row.names = FALSE)
+cat("\nCleaned dataset exported as Student_Depression_Cleaned.csv\n")
+cat("Final sample size used for analysis:", nrow(df), "students\n")
+####################################################
+# SECTION 6: RESEARCH OBJECTIVES
+####################################################
+
+# General Objective:
+# To examine factors associated with depression among university students using
+# statistical inference and multivariable logistic regression.
+#
+# Specific Objectives:
+# 1. Describe students' demographic, academic, lifestyle, and mental-health data.
+# 2. Test whether selected categorical and numerical predictors differ by depression.
+# 3. Model the probability of depression using all specified predictor variables.
+# 4. Evaluate predictive accuracy and identify the most influential predictors.
+#
+# Research Questions:
+# 1. Are academic pressure, financial stress, sleep duration, CGPA, family history,
+#    and gender associated with depression?
+# 2. Which student characteristics independently predict depression?
+# 3. How accurately can the fitted model classify depression status?
+
+####################################################
+# SECTION 7: HYPOTHESES
+####################################################
+
+# H01: Academic Pressure has no significant relationship with Depression.
+# H11: Academic Pressure has a significant relationship with Depression.
+# H02: Financial Stress has no significant relationship with Depression.
+# H12: Financial Stress has a significant relationship with Depression.
+# H03: Sleep Duration has no significant relationship with Depression.
+# H13: Sleep Duration has a significant relationship with Depression.
+# H04: CGPA has no significant relationship with Depression.
+# H14: CGPA has a significant relationship with Depression.
+# H05: Family History of Mental Illness has no significant relationship with Depression.
+# H15: Family History of Mental Illness has a significant relationship with Depression.
+# H06: Gender has no significant relationship with Depression.
+# H16: Gender has a significant relationship with Depression.
+
+####################################################
+# SECTION 8: ASSUMPTION CHECKING
+####################################################
+
+continuous_tests <- c("Age", "CGPA", "Academic.Pressure", "Study.Satisfaction",
+                      "Financial.Stress", "Work.Study.Hours")
+assumption_results <- list()
+
+for (variable in continuous_tests) {
+  cat("\nAssumption checks for", variable, "by Depression\n")
+  group_p <- tapply(df[[variable]], df$Depression, safe_shapiro)
+  print(group_p)
+  for (group_name in names(group_p)) {
+    if (is.na(group_p[[group_name]])) {
+      cat(group_name, ": Normality could not be assessed.\n")
+    } else if (group_p[[group_name]] > alpha) {
+      cat(group_name, ": Data is normally distributed (Shapiro-Wilk p > 0.05).\n")
+    } else {
+      cat(group_name, ": Data is NOT normally distributed (Shapiro-Wilk p <= 0.05).\n")
+    }
+  }
+  lev <- car::leveneTest(as.formula(paste(variable, "~ Depression")), data = df)
+  lev_p <- lev["Pr(>F)"][1, 1]
+  print(lev)
+  if (lev_p > alpha) {
+    cat("Levene test: Homogeneity of variance is satisfied.\n")
+  } else {
+    cat("Levene test: Homogeneity of variance is NOT satisfied.\n")
+  }
+  assumption_results[[variable]] <- tibble(
+    Variable = variable, Shapiro_No = unname(group_p["No"]),
+    Shapiro_Yes = unname(group_p["Yes"]), Levene_p = lev_p
+  )
+  
+  qq_plot <- ggplot(df, aes(sample = .data[[variable]])) +
+    stat_qq(colour = "#2166AC", alpha = 0.45) + stat_qq_line(colour = "#B2182B") +
+    facet_wrap(~Depression) + labs(title = paste("Q-Q Plot:", variable, "by Depression"),
+                                   x = "Theoretical Quantiles", y = "Sample Quantiles") + project_theme
+  ggsave(paste0("QQPlot_", variable, ".png"), qq_plot, width = 7, height = 4.8, dpi = 300)
+}
+assumption_results <- bind_rows(assumption_results)
+####################################################
+# SECTION 9: CHI-SQUARE TESTS
+####################################################
+
+chi_variables <- c("Gender", "Sleep.Duration", "Dietary.Habits",
+                   "Family.History.of.Mental.Illness",
+                   "Have.you.ever.had.suicidal.thoughts..", "Degree")
+chi_labels <- c("Gender", "Sleep Duration", "Dietary Habits", "Family History",
+                "Suicidal Thoughts", "Degree")
+chi_results <- list()
+
+for (i in seq_along(chi_variables)) {
+  variable <- chi_variables[i]
+  label <- chi_labels[i]
+  observed <- table(df[[variable]], df$Depression)
+  chi_test <- suppressWarnings(chisq.test(observed))
+  cat("\nChi-square test:", label, "vs Depression\nObserved table:\n")
+  print(observed)
+  cat("Expected table:\n")
+  print(round(chi_test$expected, 2))
+  cat("Chi-square statistic:", round(unname(chi_test$statistic), 4), "\n")
+  cat("Degrees of freedom:", unname(chi_test$parameter), "\n")
+  cat("P-value:", format.pval(chi_test$p.value, digits = 4), "\n")
+  interpretation <- ifelse(chi_test$p.value < alpha,
+                           paste(label, "has a statistically significant association with Depression."),
+                           paste(label, "does not have a statistically significant association with Depression."))
+  print_inference(paste("H0:", label, "and Depression are independent."), chi_test$p.value,
+                  interpretation, "Interpret association alongside effect size and sample context.",
+                  paste("Chi-square test:", label, "vs Depression"))
+  chi_results[[i]] <- tibble(Variable = label, Chi_Square = unname(chi_test$statistic),
+                             Degrees_of_Freedom = unname(chi_test$parameter), P_Value = chi_test$p.value,
+                             Decision = ifelse(chi_test$p.value < alpha, "Reject H0", "Fail to reject H0"),
+                             Minimum_Expected_Count = min(chi_test$expected))
+}
+chi_results <- bind_rows(chi_results)
+####################################################
+# SECTION 10: INDEPENDENT SAMPLES T-TEST
+####################################################
+
+ttest_variables <- c("Age", "CGPA", "Academic.Pressure", "Study.Satisfaction",
+                     "Financial.Stress", "Work.Study.Hours")
+ttest_labels <- c("Age", "CGPA", "Academic Pressure", "Study Satisfaction",
+                  "Financial Stress", "Study Hours")
+ttest_results <- list()
+
+for (i in seq_along(ttest_variables)) {
+  variable <- ttest_variables[i]
+  label <- ttest_labels[i]
+  p_by_group <- tapply(df[[variable]], df$Depression, safe_shapiro)
+  normality_ok <- all(!is.na(p_by_group) & p_by_group > alpha)
+  levene_p <- car::leveneTest(as.formula(paste(variable, "~ Depression")), data = df)["Pr(>F)"][1, 1]
+  group_means <- df %>% group_by(Depression) %>% summarise(Mean = mean(.data[[variable]]), .groups = "drop")
+  
+  if (normality_ok) {
+    test <- t.test(as.formula(paste(variable, "~ Depression")), data = df,
+                   var.equal = levene_p > alpha)
+    method <- ifelse(levene_p > alpha, "Independent samples t-test", "Welch t-test")
+    statistic <- unname(test$statistic)
+    df_test <- unname(test$parameter)
+    effect <- effectsize::cohens_d(as.formula(paste(variable, "~ Depression")), data = df)$Cohens_d[1]
+  } else {
+    test <- wilcox.test(as.formula(paste(variable, "~ Depression")), data = df, exact = FALSE)
+    method <- "Mann-Whitney U test"
+    statistic <- unname(test$statistic)
+    df_test <- NA_real_
+    effect <- NA_real_
+  }
+  p_value <- test$p.value
+  interpretation <- ifelse(p_value < alpha,
+                           paste("Mean/rank", label, "differs significantly between depression groups."),
+                           paste("There is no statistically significant difference in", label, "between depression groups."))
+  cat("\n", method, "for", label, "\n", sep = "")
+  print(group_means)
+  print_inference(paste("H0: The", label, "distribution is equal for No and Yes Depression."),
+                  p_value, interpretation, "Use the group summaries to describe the direction of the difference.", method)
+  ttest_results[[i]] <- tibble(Variable = label, Test = method, Statistic = statistic,
+                               Degrees_of_Freedom = df_test, P_Value = p_value, Effect_Size_Cohens_d = effect,
+                               Decision = ifelse(p_value < alpha, "Reject H0", "Fail to reject H0"))
+}
+ttest_results <- bind_rows(ttest_results)
+####################################################
+# SECTION 11: ONE-WAY ANOVA
+####################################################
+
+anova_specs <- list(
+  list(outcome = "CGPA", group = "Sleep.Duration", label = "CGPA by Sleep Duration"),
+  list(outcome = "Academic.Pressure", group = "Dietary.Habits", label = "Academic Pressure by Dietary Habits"),
+  list(outcome = "Financial.Stress", group = "Degree", label = "Financial Stress by Degree")
+)
+anova_results <- list()
+
+for (i in seq_along(anova_specs)) {
+  spec <- anova_specs[[i]]
+  model_formula <- as.formula(paste(spec$outcome, "~", spec$group))
+  anova_model <- aov(model_formula, data = df)
+  anova_table <- summary(anova_model)[[1]]
+  p_value <- anova_table[1, "Pr(>F)"]
+  cat("\nANOVA:", spec$label, "\n")
+  print(anova_table)
+  interpretation <- ifelse(p_value < alpha,
+                           paste("At least one", spec$group, "group has a different mean", spec$outcome, "."),
+                           paste("No evidence of a difference in mean", spec$outcome, "across", spec$group, "groups."))
+  print_inference(paste("H0: Mean", spec$outcome, "is equal across", spec$group, "groups."),
+                  p_value, interpretation, "ANOVA identifies an overall difference; inspect Tukey comparisons when significant.",
+                  paste("One-way ANOVA:", spec$label))
+  if (!is.na(p_value) && p_value < alpha) {
+    cat("Tukey HSD post-hoc comparisons:\n")
+    print(TukeyHSD(anova_model))
+  }
+  anova_results[[i]] <- tibble(Analysis = spec$label, F_Statistic = anova_table[1, "F value"],
+                               Numerator_DF = anova_table[1, "Df"], Denominator_DF = anova_table[2, "Df"],
+                               P_Value = p_value, Decision = ifelse(p_value < alpha, "Reject H0", "Fail to reject H0"))
+}
+anova_results <- bind_rows(anova_results)
+####################################################
+# SECTION 12: LOGISTIC REGRESSION
+####################################################
+
+# Create a numeric outcome for glm while retaining the labelled Depression factor.
+df <- df %>% mutate(Depression_Binary = ifelse(Depression == "Yes", 1, 0))
+predictor_variables <- c("Age", "Gender", "Academic.Pressure", "Study.Satisfaction",
+                         "CGPA", "Work.Study.Hours", "Sleep.Duration", "Dietary.Habits", "Degree",
+                         "Financial.Stress", "Family.History.of.Mental.Illness",
+                         "Have.you.ever.had.suicidal.thoughts..")
+model_formula <- as.formula(paste("Depression_Binary ~", paste(predictor_variables, collapse = " + ")))
+logistic_model <- glm(model_formula, data = df, family = binomial(link = "logit"))
+
+cat("\nLogistic regression model summary:\n")
+print(summary(logistic_model))
+regression_coefficients <- broom::tidy(logistic_model, conf.int = TRUE) %>%
+  mutate(Significant = ifelse(p.value < alpha, "Yes", "No"))
+print(regression_coefficients)
+
+odds_ratios <- regression_coefficients %>%
+  transmute(Term = term, Odds_Ratio = exp(estimate), CI_Lower = exp(conf.low),
+            CI_Upper = exp(conf.high), P_Value = p.value,
+            Significant = Significant) %>%
+  arrange(desc(abs(log(Odds_Ratio))))
+cat("\nOdds ratios with 95% confidence intervals:\n")
+print(odds_ratios)
+
+for (row in seq_len(nrow(regression_coefficients))) {
+  term_name <- regression_coefficients$term[row]
+  if (term_name != "(Intercept)") {
+    p_value <- regression_coefficients$p.value[row]
+    direction <- ifelse(regression_coefficients$estimate[row] > 0, "increases", "decreases")
+    print_inference(paste("H0: Regression coefficient for", term_name, "equals zero."), p_value,
+                    ifelse(p_value < alpha, paste(term_name, "is a significant predictor of Depression."),
+                           paste(term_name, "is not a statistically significant predictor after adjustment.")),
+                    paste("Holding other variables constant, this predictor", direction, "the odds of depression."),
+                    paste("Logistic regression coefficient:", term_name))
+  }
+}
+####################################################
+# SECTION 13: MULTICOLLINEARITY
+####################################################
+
+vif_raw <- car::vif(logistic_model)
+if (is.matrix(vif_raw)) {
+  vif_results <- as.data.frame(vif_raw) %>% tibble::rownames_to_column("Variable") %>%
+    mutate(Adjusted_VIF = GVIF^(1 / (2 * Df)), Interpretation = case_when(
+      Adjusted_VIF < 5 ~ "Low multicollinearity", Adjusted_VIF < 10 ~ "Moderate multicollinearity",
+      TRUE ~ "High multicollinearity"))
+} else {
+  vif_results <- tibble(Variable = names(vif_raw), VIF = as.numeric(vif_raw)) %>%
+    mutate(Adjusted_VIF = VIF, Interpretation = case_when(
+      VIF < 5 ~ "Low multicollinearity", VIF < 10 ~ "Moderate multicollinearity",
+      TRUE ~ "High multicollinearity"))
+}
+cat("\nVariance Inflation Factors:\n")
+print(vif_results)
+apply(vif_results, 1, function(x) cat(x[["Variable"]], ":", x[["Interpretation"]], "(adjusted VIF =", round(as.numeric(x[["Adjusted_VIF"]]), 2), ")\n"))
+####################################################
+# SECTION 14: GOODNESS OF FIT
+####################################################
+
+predicted_probability <- predict(logistic_model, type = "response")
+hl_test <- ResourceSelection::hoslem.test(df$Depression_Binary, predicted_probability, g = 10)
+nagelkerke_r2 <- DescTools::PseudoR2(logistic_model, which = "Nagelkerke")
+model_aic <- AIC(logistic_model)
+model_bic <- BIC(logistic_model)
+
+cat("\nHosmer-Lemeshow goodness-of-fit test:\n")
+print(hl_test)
+print_inference("H0: The logistic model fits the observed data adequately.", hl_test$p.value,
+                ifelse(hl_test$p.value > alpha, "No evidence of lack of fit; calibration is acceptable.",
+                       "Evidence of lack of fit; interpret predictions cautiously."),
+                "Use calibration, discrimination, and classification measures together.", "Hosmer-Lemeshow test")
+cat("Nagelkerke pseudo R-squared:", round(nagelkerke_r2, 4), "\n")
+cat("AIC:", round(model_aic, 2), " | BIC:", round(model_bic, 2), "\n")
+cat("Lower AIC/BIC values indicate a more parsimonious fit only when models are compared on the same data.\n")
+####################################################
+# SECTION 15: PREDICTION
+####################################################
+
+predicted_class <- factor(ifelse(predicted_probability >= 0.50, "Yes", "No"), levels = c("No", "Yes"))
+actual_class <- factor(df$Depression, levels = c("No", "Yes"))
+confusion <- caret::confusionMatrix(predicted_class, actual_class, positive = "Yes")
+cat("\nConfusion matrix:\n")
+print(confusion$table)
+cat("\nClassification performance:\n")
+print(confusion$overall)
+print(confusion$byClass)
+
+precision <- unname(confusion$byClass["Precision"])
+recall <- unname(confusion$byClass["Recall"])
+specificity <- unname(confusion$byClass["Specificity"])
+f1_score <- unname(confusion$byClass["F1"])
+accuracy <- unname(confusion$overall["Accuracy"])
+kappa <- unname(confusion$overall["Kappa"])
+performance_results <- tibble(Accuracy = accuracy, Precision = precision, Recall = recall,
+                              Specificity = specificity, Sensitivity = recall, F1_Score = f1_score, Kappa = kappa)
+print(performance_results)
+print_inference("H0: The model performs no better than chance classification.", NA_real_,
+                "Classification measures describe in-sample predictive performance; they are not a hypothesis test.",
+                paste("Accuracy is", round(100 * accuracy, 2), "%; validate on new data before operational use."),
+                "Prediction performance")
+####################################################
+# SECTION 16: ROC CURVE
+####################################################
+
+roc_object <- pROC::roc(response = actual_class, predictor = predicted_probability,
+                        levels = c("No", "Yes"), direction = "<")
+auc_value <- as.numeric(pROC::auc(roc_object))
+auc_interpretation <- dplyr::case_when(
+  auc_value >= 0.90 ~ "excellent discrimination",
+  auc_value >= 0.80 ~ "good discrimination",
+  auc_value >= 0.70 ~ "acceptable discrimination",
+  auc_value >= 0.60 ~ "poor discrimination",
+  TRUE ~ "no useful discrimination"
+)
+cat("AUC:", round(auc_value, 4), "-", auc_interpretation, "\n")
+print_inference("H0: AUC equals 0.50 (no discrimination).", NA_real_,
+                paste("The model has", auc_interpretation, "with AUC =", round(auc_value, 3), "."),
+                "A higher AUC means better separation of students with and without depression.", "ROC analysis")
+
+roc_plot <- ggroc(roc_object, colour = "#2166AC", linewidth = 1.2) +
+  geom_abline(linetype = "dashed", colour = "grey45") +
+  annotate("text", x = 0.62, y = 0.10, label = paste("AUC =", round(auc_value, 3)), size = 4.5) +
+  labs(title = "ROC Curve: Logistic Regression Model", x = "1 - Specificity", y = "Sensitivity") + project_theme
+ggsave("ROC_Curve_Publication_Quality.png", roc_plot, width = 7, height = 5.5, dpi = 300)
+####################################################
+# SECTION 17: VARIABLE IMPORTANCE
+####################################################
+
+# Absolute Wald z statistics rank terms by adjusted evidence in the fitted model.
+variable_importance <- regression_coefficients %>% filter(term != "(Intercept)") %>%
+  transmute(Variable = term, Estimate = estimate, Odds_Ratio = exp(estimate),
+            Wald_Z = statistic, P_Value = p.value, Importance = abs(statistic),
+            Significant = Significant) %>% arrange(desc(Importance))
+cat("\nVariable importance table (most to least important):\n")
+print(variable_importance)
+
+importance_plot <- variable_importance %>% slice_head(n = 20) %>%
+  mutate(Variable = reorder(Variable, Importance)) %>%
+  ggplot(aes(x = Variable, y = Importance, fill = Significant)) +
+  geom_col() + coord_flip() + scale_fill_manual(values = c("Yes" = "#B2182B", "No" = "#92B6D5")) +
+  labs(title = "Variable Importance in the Logistic Regression Model", x = NULL,
+       y = "Absolute Wald z Statistic", fill = "Significant") + project_theme
+ggsave("Variable_Importance_Plot.png", importance_plot, width = 9, height = 7, dpi = 300)
+####################################################
+# SECTION 18: PUBLICATION QUALITY GRAPHS
+####################################################
+
+# Predicted probability by observed depression status.
+probability_plot <- tibble(Depression = actual_class, Probability = predicted_probability) %>%
+  ggplot(aes(x = Depression, y = Probability, fill = Depression)) +
+  geom_boxplot(alpha = 0.75, outlier.alpha = 0.25) +
+  geom_jitter(width = 0.12, alpha = 0.08, size = 0.7) +
+  scale_fill_manual(values = c("No" = "#4CAF50", "Yes" = "#E57373")) +
+  labs(title = "Predicted Probability of Depression by Observed Status", x = "Observed Depression", y = "Predicted Probability") +
+  theme(legend.position = "none") + project_theme
+ggsave("Logistic_Regression_Probability_Plot.png", probability_plot, width = 7, height = 5.5, dpi = 300)
+
+# Adjusted odds ratios and confidence intervals for interpretable model terms.
+or_plot_data <- odds_ratios %>% filter(Term != "(Intercept)", is.finite(Odds_Ratio),
+                                       is.finite(CI_Lower), is.finite(CI_Upper)) %>% slice_head(n = 25) %>% mutate(Term = reorder(Term, Odds_Ratio))
+odds_ratio_plot <- ggplot(or_plot_data, aes(x = Term, y = Odds_Ratio, ymin = CI_Lower, ymax = CI_Upper, colour = Significant)) +
+  geom_hline(yintercept = 1, linetype = "dashed", colour = "grey40") +
+  geom_pointrange() + coord_flip() + scale_y_log10() +
+  scale_colour_manual(values = c("Yes" = "#B2182B", "No" = "#2166AC")) +
+  labs(title = "Adjusted Odds Ratios with 95% Confidence Intervals", x = NULL,
+       y = "Odds Ratio (log scale)", colour = "Significant") + project_theme
+ggsave("Odds_Ratio_Plot.png", odds_ratio_plot, width = 9, height = 7, dpi = 300)
+
+# Distribution of fitted probabilities by predicted class.
+prediction_distribution_plot <- tibble(Predicted_Class = predicted_class, Probability = predicted_probability) %>%
+  ggplot(aes(x = Probability, fill = Predicted_Class)) + geom_density(alpha = 0.55) +
+  geom_vline(xintercept = 0.50, linetype = "dashed") +
+  scale_fill_manual(values = c("No" = "#4CAF50", "Yes" = "#E57373")) +
+  labs(title = "Distribution of Predicted Depression Probabilities", x = "Predicted Probability", y = "Density", fill = "Predicted Class") + project_theme
+ggsave("Prediction_Distribution_Plot.png", prediction_distribution_plot, width = 7, height = 5.5, dpi = 300)
+
+# Deviance residuals identify systematic model misfit or unusual observations.
+residual_plot <- tibble(Fitted = predicted_probability, Deviance_Residual = residuals(logistic_model, type = "deviance")) %>%
+  ggplot(aes(x = Fitted, y = Deviance_Residual)) + geom_point(alpha = 0.18, colour = "#2166AC") +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "#B2182B") +
+  geom_smooth(method = "loess", se = FALSE, colour = "#EF6C00") +
+  labs(title = "Deviance Residuals versus Fitted Probabilities", x = "Fitted Probability", y = "Deviance Residual") + project_theme
+ggsave("Residual_Plot.png", residual_plot, width = 7, height = 5.5, dpi = 300)
+####################################################
+# SECTION 19: AUTOMATIC INTERPRETATION
+####################################################
+
+# Each inferential section above calls print_inference() immediately after its
+# test. The following concise model summary completes the automated narrative.
+significant_terms <- variable_importance %>% filter(P_Value < alpha) %>% pull(Variable)
+cat("\nAUTOMATIC MODEL INTERPRETATION\n")
+cat("Hypothesis: All adjusted logistic regression coefficients equal zero.\n")
+cat("P-value: Individual coefficient p-values are printed in Section 12.\n")
+cat("Decision: ", ifelse(length(significant_terms) > 0, "At least one adjusted predictor is significant.", "No adjusted predictor is significant."), "\n", sep = "")
+cat("Interpretation: ", length(significant_terms), "model term(s) are significant at alpha = 0.05.\n", sep = "")
+cat("Practical conclusion: The model should support understanding and screening, not clinical diagnosis.\n")
+####################################################
+# SECTION 20: EXPORT RESULTS
+####################################################
+
+# Export requested submission tables with clear, consistent filenames.
+write.csv(descriptive_stats, "Descriptive Statistics.csv", row.names = FALSE)
+write.csv(chi_results, "ChiSquareResults.csv", row.names = FALSE)
+write.csv(ttest_results, "TTestResults.csv", row.names = FALSE)
+write.csv(anova_results, "ANOVAResults.csv", row.names = FALSE)
+write.csv(regression_coefficients, "RegressionCoefficients.csv", row.names = FALSE)
+write.csv(odds_ratios, "OddsRatios.csv", row.names = FALSE)
+write.csv(as.data.frame.matrix(confusion$table) %>% tibble::rownames_to_column("Predicted"),
+          "ConfusionMatrix.csv", row.names = FALSE)
+write.csv(performance_results %>% mutate(AUC = auc_value, AIC = model_aic, BIC = model_bic,
+                                         Nagelkerke_R2 = nagelkerke_r2, Hosmer_Lemeshow_P = hl_test$p.value),
+          "ModelPerformance.csv", row.names = FALSE)
+write.csv(variable_importance, "VariableImportance.csv", row.names = FALSE)
+write.csv(tibble(Observed_Depression = actual_class, Predicted_Probability = predicted_probability,
+                 Predicted_Class = predicted_class), "PredictedProbabilities.csv", row.names = FALSE)
+write.csv(assumption_results, "AssumptionCheckResults.csv", row.names = FALSE)
+write.csv(outlier_summary, "OutlierSummary.csv", row.names = FALSE)
+
+cat("\n====================================================\n")
+cat("ANALYSIS COMPLETE\n")
+cat("All requested CSV tables and 300 dpi PNG figures were saved to:C:\users\karya\IdeaProjects\group project.java\out\artifacts\group_project_java_jar\n")
+cat(normalizePath(results_dir, winslash = "/"), "\n")
+cat("====================================================\n")
+
